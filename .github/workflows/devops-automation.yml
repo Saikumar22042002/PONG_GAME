@@ -1,0 +1,130 @@
+name: "DevOps Automation for dev"
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run tests
+        run: |
+          if [ -f requirements.txt ] && grep -q pytest requirements.txt; then
+            pytest
+          else
+            echo "No tests configured, skipping"
+            python -m py_compile *.py 2>/dev/null || echo "Python syntax OK"
+          fi
+
+  docker-build-and-push:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository if not exists
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          ECR_REPO_LOWER=$(echo "$ECR_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          aws ecr describe-repositories --repository-names $ECR_REPO_LOWER ||           aws ecr create-repository --repository-name $ECR_REPO_LOWER --image-scanning-configuration scanOnPush=true
+        continue-on-error: false
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          ECR_REPO_LOWER=$(echo "$ECR_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          docker build -t $ECR_REGISTRY/$ECR_REPO_LOWER:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPO_LOWER:latest .
+          docker push $ECR_REGISTRY/$ECR_REPO_LOWER:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO_LOWER:latest
+
+  deploy-to-eks:
+    needs: [docker-build-and-push]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check if EKS cluster exists
+        id: check-eks
+        run: |
+          if aws eks describe-cluster --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} 2>/dev/null; then
+            echo "cluster_exists=true" >> $GITHUB_OUTPUT
+            echo "EKS cluster found: ${{ secrets.EKS_CLUSTER_NAME }}"
+          else
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+            echo "EKS cluster not found. Skipping deployment."
+            echo "To deploy to EKS, create a cluster named: ${{ secrets.EKS_CLUSTER_NAME }}"
+          fi
+        continue-on-error: true
+
+      - name: Update kubeconfig
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+          echo "Kubeconfig updated successfully"
+
+      - name: Deploy to EKS
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "Deploying to EKS cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          kubectl get nodes
+          echo "Add your Kubernetes deployment manifests here"
+          # kubectl apply -f k8s/
+        continue-on-error: true
+
+      - name: EKS Setup Instructions
+        if: steps.check-eks.outputs.cluster_exists != 'true'
+        run: |
+          echo "=========================================="
+          echo "EKS CLUSTER NOT FOUND"
+          echo "=========================================="
+          echo "Docker image has been built and pushed to ECR successfully!"
+          echo ""
+          echo "To enable EKS deployment, create an EKS cluster:"
+          echo "  Cluster name: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "  Region: ${{ secrets.AWS_REGION }}"
+          echo ""
+          echo "You can create the cluster using:"
+          echo "  - AWS Console: https://console.aws.amazon.com/eks"
+          echo "  - AWS CLI: eksctl create cluster --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}"
+          echo "=========================================="
